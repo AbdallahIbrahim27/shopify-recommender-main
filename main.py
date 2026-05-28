@@ -221,6 +221,9 @@ async def build_map(request: RecommendRequest):
         artifact = await build_shop_artifact(request.shop_domain)
     except WorkerError as e:
         raise HTTPException(status_code=502, detail=f"Upstream data unavailable: {e}")
+    except Exception as e:
+        logger.exception("build_map failed for %s", request.shop_domain)
+        raise HTTPException(status_code=500, detail=str(e))  # now shows real error
     if not artifact:
         return {"status": "no products", "products_indexed": 0}
     return {
@@ -229,8 +232,6 @@ async def build_map(request: RecommendRequest):
         "has_collaborative": artifact["item_vecs"] is not None,
         "built_at": artifact["built_at"],
     }
-
-
 # ----------------------------------------------------------------------
 # HEALTH CHECK
 # ----------------------------------------------------------------------

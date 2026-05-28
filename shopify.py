@@ -25,7 +25,11 @@ class WorkerError(RuntimeError):
 def _base_url() -> str:
     if not _settings.worker_url:
         raise WorkerError("WORKER_URL is not configured.")
-    return _settings.worker_url.rstrip("/")
+    url = _settings.worker_url.rstrip("/")
+    # Normalize: strip any existing protocol then re-add https://
+    # Guards against WORKER_URL being set without a protocol in Railway env vars.
+    url = url.removeprefix("https://").removeprefix("http://")
+    return f"https://{url}"
 
 
 def _headers() -> dict:
@@ -96,7 +100,7 @@ async def get_products(shop_domain):
             resp = await client.get(f"{base}/products", params={"shop": shop_domain})
             resp.raise_for_status()
             raw = resp.json().get("products", [])
-    except (httpx.HTTPError, ValueError) as e:
+    except (httpx.HTTPError, httpx.UnsupportedProtocol, ValueError) as e:
         raise WorkerError(f"Failed to fetch products: {e}") from e
 
     return [n for n in (normalize_product(p) for p in raw) if n]
@@ -127,7 +131,7 @@ async def get_all_orders(shop_domain):
                 if not cursor:
                     break
                 await asyncio.sleep(0.05)
-    except (httpx.HTTPError, ValueError) as e:
+    except (httpx.HTTPError, httpx.UnsupportedProtocol, ValueError) as e:
         raise WorkerError(f"Failed to fetch orders: {e}") from e
 
     if pages >= _settings.worker_max_order_pages and cursor:
