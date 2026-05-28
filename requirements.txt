@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+redis
+numpy
+scikit-learn
+pandas
+python-dotenv
+pydantic
+sentence-transformers
+torch
