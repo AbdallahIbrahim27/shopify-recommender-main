@@ -3,9 +3,10 @@ uvicorn
 httpx
 redis
 numpy
+scipy
 scikit-learn
-pandas
-python-dotenv
-pydantic
 sentence-transformers
 torch
+pydantic
+pydantic-settings
+python-dotenv
