@@ -2,7 +2,7 @@ import httpx
 import asyncio
 import os
 
-WORKER_URL = os.getenv("WORKER_URL", "http://localhost:8000")
+WORKER_URL = os.getenv("WORKER_URL")
 TIMEOUT = 60
 
 
