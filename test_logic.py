@@ -93,7 +93,9 @@ assert len(body["recommendations"]) == 3, "limit not honored"
 top = body["recommendations"][0]
 assert set(top) >= {"product_id", "url", "source", "score", "image", "tags"}, top.keys()
 assert all("source" in x for x in body["recommendations"])
-print("6. recommend (limit honored=%d, source=%s, has url/image): PASS"
+# Already-purchased product 1 must not be recommended back.
+assert all(x["product_id"] != 1 for x in body["recommendations"]), body["recommendations"]
+print("6. recommend (limit honored=%d, source=%s, no purchased echo): PASS"
       % (len(body["recommendations"]), top["source"]))
 
 # ---------- 7. cold-start fallback to popularity ----------
@@ -117,5 +119,14 @@ print("8. worker unreachable -> 200 'degraded' (no 500): PASS")
 r = client.get("/health")
 assert r.status_code == 200 and r.json()["status"] == "ok"
 print("9. health: PASS  (%s)" % r.json())
+
+# ---------- 10. _base_url preserves an explicit scheme ----------
+import shopify
+shopify._settings.worker_url = "http://localhost:9000"
+assert shopify._base_url() == "http://localhost:9000", shopify._base_url()
+shopify._settings.worker_url = "example.com/api"          # no scheme -> https
+assert shopify._base_url() == "https://example.com/api", shopify._base_url()
+shopify._settings.worker_url = None
+print("10. _base_url scheme handling (http preserved, bare -> https): PASS")
 
 print("\nALL TESTS PASSED")

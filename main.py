@@ -8,6 +8,7 @@ empty — instead of returning 500s.
 """
 import asyncio
 import logging
+import secrets
 import time
 from typing import Optional
 
@@ -38,7 +39,8 @@ app = FastAPI(title="Shopify Recommendation Engine")
 # ----------------------------------------------------------------------
 async def require_api_key(x_api_key: Optional[str] = Header(default=None)):
     expected = settings.internal_api_key
-    if expected and x_api_key != expected:
+    # Constant-time comparison so the key can't be recovered via timing.
+    if expected and not secrets.compare_digest(x_api_key or "", expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -79,6 +81,32 @@ async def build_shop_artifact(shop_domain):
     return artifact
 
 
+# Per-shop locks serialize concurrent first-misses so the heavy SVD + embedding
+# build runs once instead of once per racing request (cache stampede guard).
+_build_locks: dict = {}
+
+
+def _build_lock(shop_domain: str) -> asyncio.Lock:
+    lock = _build_locks.get(shop_domain)
+    if lock is None:
+        lock = asyncio.Lock()
+        _build_locks[shop_domain] = lock
+    return lock
+
+
+async def get_or_build_artifact(shop_domain: str):
+    """Return the cached artifact, building it once under a per-shop lock on a
+    miss. The double-check inside the lock lets racers reuse the first build."""
+    artifact = await cache.get_artifact(shop_domain)
+    if artifact is not None:
+        return artifact
+    async with _build_lock(shop_domain):
+        artifact = await cache.get_artifact(shop_domain)
+        if artifact is None:
+            artifact = await build_shop_artifact(shop_domain)
+    return artifact
+
+
 def _minmax(scores):
     """Scale scores to [0, 1] so heterogeneous signals are comparable (P0-3)."""
     if not scores:
@@ -100,12 +128,12 @@ def _minmax(scores):
 async def recommend(request: RecommendRequest):
     started = time.time()
     limit = request.limit or settings.recommend_limit_default
+    # Clamp so a caller can't request an unbounded result set.
+    limit = max(1, min(limit, settings.recommend_limit_max))
 
     # Load (or lazily build) the per-shop artifact; never surface a 500 (P1-1).
     try:
-        artifact = await cache.get_artifact(request.shop_domain)
-        if artifact is None:
-            artifact = await build_shop_artifact(request.shop_domain)
+        artifact = await get_or_build_artifact(request.shop_domain)
     except WorkerError as e:
         logger.error("Worker unavailable for %s: %s", request.shop_domain, e)
         return RecommendResponse(recommendations=[], status="degraded")
@@ -182,8 +210,16 @@ async def recommend(request: RecommendRequest):
     ranked = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
     product_map = {p["id"]: p for p in products}
 
+    # Don't recommend products the customer already bought — collaborative
+    # scoring ranks the seed itself highest, which would echo purchases back.
+    already_purchased = set(request.purchased_product_ids or [])
+
     recommendations = []
-    for pid, sc in ranked[:limit]:
+    for pid, sc in ranked:
+        if len(recommendations) >= limit:
+            break
+        if pid in already_purchased:
+            continue
         p = product_map.get(pid)
         if not p:
             continue
@@ -237,10 +273,14 @@ async def build_map(request: RecommendRequest):
 # ----------------------------------------------------------------------
 @app.get("/health")
 async def health():
+    shopify_direct = bool(settings.shopify_admin_token and settings.shopify_store_domain)
     return {
         "status": "ok",
         "service": "shopify-recommender",
         "cache": "redis" if settings.redis_url else "in-memory",
         "cache_reachable": cache.ping(),
+        "data_source": "shopify-direct" if shopify_direct else "worker",
+        "shopify_direct": shopify_direct,
+        "shopify_store": settings.shopify_store_domain if shopify_direct else None,
         "worker_configured": bool(settings.worker_url),
     }

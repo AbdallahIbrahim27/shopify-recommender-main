@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     worker_timeout_build: float = 60.0        # generous budget for precompute
     worker_max_order_pages: int = 200         # cap full-history pagination
 
+    # --- Direct Shopify Admin API (used instead of the worker when a token is
+    #     configured). Lets the app talk to a real store with no proxy. ---
+    shopify_store_domain: Optional[str] = None   # SHOPIFY_STORE_DOMAIN (foo.myshopify.com)
+    shopify_admin_token: Optional[str] = None    # SHOPIFY_ADMIN_TOKEN (shpat_...)
+    shopify_api_version: str = "2024-10"         # SHOPIFY_API_VERSION
+
     # --- Inbound auth (Helm -> recommender). Caller sends RECOMMENDER_API_KEY. ---
     internal_api_key: Optional[str] = None    # INTERNAL_API_KEY
 
@@ -31,6 +37,7 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
     svd_components: int = 20
     recommend_limit_default: int = 4
+    recommend_limit_max: int = 50          # upper bound on a caller's `limit`
     weight_collab: float = 0.55
     weight_tags: float = 0.30
     weight_browse: float = 0.15

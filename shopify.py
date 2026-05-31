@@ -9,6 +9,7 @@ canonical int (handling Shopify GIDs).
 """
 import asyncio
 import logging
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -19,16 +20,85 @@ _settings = get_settings()
 
 
 class WorkerError(RuntimeError):
-    """Raised when the Shopify data proxy is unreachable or returns an error."""
+    """Raised when the Shopify data source is unreachable or returns an error."""
+
+
+# ----------------------------------------------------------------------
+# Direct Shopify Admin API mode. Enabled when a store domain + admin token
+# are configured; otherwise the Cloudflare Worker proxy path is used.
+# ----------------------------------------------------------------------
+def _use_direct() -> bool:
+    return bool(_settings.shopify_admin_token and _settings.shopify_store_domain)
+
+
+def _clean_domain(shop_domain=None) -> str:
+    dom = (shop_domain or _settings.shopify_store_domain or "").strip().rstrip("/")
+    return dom.removeprefix("https://").removeprefix("http://")
+
+
+def _admin_base(shop_domain=None) -> str:
+    dom = _clean_domain(shop_domain)
+    if not dom:
+        raise WorkerError("SHOPIFY_STORE_DOMAIN is not configured.")
+    return f"https://{dom}/admin/api/{_settings.shopify_api_version}"
+
+
+def _admin_headers() -> dict:
+    return {
+        "X-Shopify-Access-Token": _settings.shopify_admin_token or "",
+        "Accept": "application/json",
+    }
+
+
+def _next_page_info(resp) -> "str | None":
+    """Extract the page_info cursor from Shopify's Link header (rel=next)."""
+    link = resp.headers.get("link") or resp.headers.get("Link")
+    if not link:
+        return None
+    for part in link.split(","):
+        segments = part.split(";")
+        if len(segments) < 2 or 'rel="next"' not in segments[1]:
+            continue
+        url = segments[0].strip().strip("<>")
+        return parse_qs(urlparse(url).query).get("page_info", [None])[0]
+    return None
+
+
+def _map_shopify_product(p, shop) -> dict:
+    """Map a native Shopify Admin product into the worker-equivalent shape."""
+    img = p.get("image")
+    image = img.get("src") if isinstance(img, dict) else img
+    handle = p.get("handle")
+    return {
+        "id": p.get("id"),
+        "title": p.get("title"),
+        "url": f"https://{shop}/products/{handle}" if handle else "",
+        "image": image,
+        "price": None,                      # normalize_product pulls from variants
+        "product_type": p.get("product_type"),
+        "tags": p.get("tags"),              # comma string -> _normalize_tags handles
+        "variants": p.get("variants"),
+    }
+
+
+def _map_shopify_order(o) -> dict:
+    """Map a native Shopify Admin order into the worker-equivalent shape."""
+    return {
+        "customer_id": (o.get("customer") or {}).get("id"),
+        "line_items": o.get("line_items", []),
+    }
 
 
 def _base_url() -> str:
     if not _settings.worker_url:
         raise WorkerError("WORKER_URL is not configured.")
     url = _settings.worker_url.rstrip("/")
-    # Normalize: strip any existing protocol then re-add https://
-    # Guards against WORKER_URL being set without a protocol in Railway env vars.
-    url = url.removeprefix("https://").removeprefix("http://")
+    # Preserve an explicit scheme so a local http worker (e.g. mock_worker on
+    # http://localhost:9000) stays reachable. Only default to https:// when no
+    # scheme is given, guarding against WORKER_URL being set without a protocol
+    # in Railway env vars.
+    if url.startswith(("http://", "https://")):
+        return url
     return f"https://{url}"
 
 
@@ -91,7 +161,41 @@ def normalize_order(o):
     return {"customer_id": o.get("customer_id"), "line_items": items}
 
 
+async def _get_products_direct(shop_domain):
+    shop = _clean_domain(shop_domain)
+    base = _admin_base(shop_domain)
+    raw, page_info, pages = [], None, 0
+    try:
+        async with httpx.AsyncClient(
+            timeout=_settings.worker_timeout_build, headers=_admin_headers()
+        ) as client:
+            while pages < _settings.worker_max_order_pages:
+                # page_info is mutually exclusive with other filters on Shopify.
+                params = {"page_info": page_info} if page_info else {}
+                params["limit"] = 250
+                resp = await client.get(f"{base}/products.json", params=params)
+                resp.raise_for_status()
+                batch = resp.json().get("products", [])
+                if not batch:
+                    break
+                raw.extend(batch)
+                page_info = _next_page_info(resp)
+                pages += 1
+                if not page_info:
+                    break
+                await asyncio.sleep(0.05)
+    except (httpx.HTTPError, ValueError) as e:
+        raise WorkerError(f"Failed to fetch products from Shopify: {e}") from e
+
+    return [
+        n for n in (normalize_product(_map_shopify_product(p, shop)) for p in raw) if n
+    ]
+
+
 async def get_products(shop_domain):
+    if _use_direct():
+        return await _get_products_direct(shop_domain)
+
     base = _base_url()
     try:
         async with httpx.AsyncClient(
@@ -106,7 +210,46 @@ async def get_products(shop_domain):
     return [n for n in (normalize_product(p) for p in raw) if n]
 
 
+async def _get_orders_direct(shop_domain):
+    base = _admin_base(shop_domain)
+    all_orders, page_info, pages = [], None, 0
+    try:
+        async with httpx.AsyncClient(
+            timeout=_settings.worker_timeout_build, headers=_admin_headers()
+        ) as client:
+            while pages < _settings.worker_max_order_pages:
+                if page_info:
+                    params = {"page_info": page_info, "limit": 250}
+                else:
+                    # status=any so closed/archived orders count too.
+                    params = {"status": "any", "limit": 250}
+                resp = await client.get(f"{base}/orders.json", params=params)
+                resp.raise_for_status()
+                batch = resp.json().get("orders", [])
+                if not batch:
+                    break
+                all_orders.extend(normalize_order(_map_shopify_order(o)) for o in batch)
+                page_info = _next_page_info(resp)
+                pages += 1
+                if not page_info:
+                    break
+                await asyncio.sleep(0.05)
+    except (httpx.HTTPError, ValueError) as e:
+        raise WorkerError(f"Failed to fetch orders from Shopify: {e}") from e
+
+    if pages >= _settings.worker_max_order_pages and page_info:
+        logger.warning(
+            "Order pagination capped at %s pages for %s",
+            _settings.worker_max_order_pages,
+            shop_domain,
+        )
+    return all_orders
+
+
 async def get_all_orders(shop_domain):
+    if _use_direct():
+        return await _get_orders_direct(shop_domain)
+
     base = _base_url()
     all_orders = []
     cursor = None
